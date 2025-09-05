@@ -1,110 +1,103 @@
-import json
+# main.py
+# A Flask application that handles Dialogflow webhook requests and
+# connects to a Firestore database for patient data verification.
+
 import os
-from flask import Flask, request, jsonify
 import firebase_admin
 from firebase_admin import credentials, firestore
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# --- Firebase Initialization ---
-# The __firebase_config and __app_id are global variables provided by the environment.
-# We'll use them to initialize the Firebase Admin SDK.
-firebase_config_str = os.getenv('__firebase_config', '{}')
-firebase_config = json.loads(firebase_config_str)
-
-# Ensure the app is only initialized once
-if not firebase_admin._apps:
+# --- Firestore Connection Setup ---
+try:
+    # On Cloud Run, credentials are automatically provided by the environment.
+    cred = credentials.ApplicationDefault()
+    firebase_admin.initialize_app(cred)
+    print("Firestore connected using Cloud Run environment credentials.")
+except ValueError:
+    # If running locally, you'll need a service account JSON file.
+    # Set the 'GOOGLE_APPLICATION_CREDENTIALS' environment variable to its file path.
     try:
-        # Check for service account credentials in the config
-        if 'private_key' in firebase_config and 'client_email' in firebase_config:
-            # Use a dictionary to create the credentials object
-            cred = credentials.Certificate(firebase_config)
-            firebase_admin.initialize_app(cred)
-        else:
-            # If no service account, try to initialize with the existing project ID
-            firebase_admin.initialize_app()
+        cred = credentials.Certificate(os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'))
+        firebase_admin.initialize_app(cred)
+        print("Firestore connected using GOOGLE_APPLICATION_CREDENTIALS.")
     except Exception as e:
-        print(f"Error initializing Firebase Admin SDK: {e}")
+        print(f"Error initializing Firebase: {e}")
+        # To prevent the app from crashing, we'll continue, but database calls will fail.
 
 db = firestore.client()
-app_id = os.getenv('__app_id', 'default-app-id')
 
-# --- Webhook Route ---
-@app.route('/verify-insurance', methods=['POST'])
-def verify_insurance():
+# --- Webhook Endpoint ---
+@app.route('/')
+def home():
+    """Returns a simple message to confirm the service is running."""
+    return "Webhook is running successfully!"
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
     """
-    Handles Dialogflow webhook requests to verify insurance details against Firestore.
+    Handles POST requests from Dialogflow. It extracts patient information
+    from the request and verifies it against the Firestore 'patients' collection.
     """
-    try:
-        req = request.get_json(silent=True, force=True)
-        print(json.dumps(req, indent=2))
+    req = request.get_json(force=True)
+    print("Request JSON:")
+    print(req)
 
-        # Extract the parameters from the Dialogflow request
-        parameters = req['fulfillmentInfo']['parameters']
-        policy_number = parameters.get('policy_number', '')
-        dob_str = parameters.get('date_of_birth', '')
-        insurance_provider = parameters.get('insurance_provider', '')
-
-        print(f"Received details: Policy Number={policy_number}, DOB={dob_str}, Provider={insurance_provider}")
-
-        # --- Query Firestore for a matching patient ---
-        # The Firestore collection path must follow the specified convention.
-        patients_collection_ref = db.collection(f'artifacts/{app_id}/public/data/patients')
-
-        # Create a query to find a matching patient document
-        # The field names here must exactly match the ones in your database.
-        query = patients_collection_ref.where('policyNumber', '==', policy_number) \
-                                     .where('dateOfBirth', '==', dob_str) \
-                                     .where('insuranceProvider', '==', insurance_provider)
-
-        docs = list(query.stream())
-
-        fulfillment_text = ""
-        tag = ""
-
-        if docs:
-            # A matching document was found
-            patient_data = docs[0].to_dict()
-            name = patient_data.get('name', 'patient')
-            fulfillment_text = f"Thank you, {name}, your insurance information has been verified."
-            tag = "valid_code"
-        else:
-            # No matching document was found
-            fulfillment_text = "I'm sorry, I could not find a match for that information. Please try again or speak with an agent."
-            tag = "invalid_code"
-
-        # --- Construct and return the Dialogflow webhook response ---
-        response_json = {
-            "fulfillmentResponse": {
-                "messages": [
-                    {
-                        "text": {
-                            "text": [fulfillment_text]
-                        }
-                    }
-                ],
-                "tag": tag
-            }
-        }
-        return jsonify(response_json)
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    query_result = req.get('queryResult', {})
+    params = query_result.get('parameters', {})
+    
+    # Extract parameters based on your Dialogflow CX configuration.
+    patient_policy_number = params.get('policy_number', '')
+    patient_provider = params.get('insurance_provider_name', '')
+    patient_dob_obj = params.get('date_of_birth', {})
+    
+    # Check if all required parameters are available.
+    if not all([patient_policy_number, patient_provider, patient_dob_obj]):
         return jsonify({
-            "fulfillmentResponse": {
-                "messages": [
-                    {
-                        "text": {
-                            "text": ["I'm sorry, an error occurred during verification."]
-                        }
-                    }
-                ]
-            }
+            "fulfillmentText": "Please provide your policy number, insurance provider, and date of birth to proceed with verification."
         })
 
+    # Format the date of birth object into a 'YYYY-MM-DD' string to match your Firestore document.
+    dob_string = f"{patient_dob_obj.get('year')}-{patient_dob_obj.get('month'):02d}-{patient_dob_obj.get('day'):02d}"
+
+    # Call the function to query the database.
+    response_text = verify_patient_insurance(
+        patient_policy_number,
+        patient_provider,
+        dob_string
+    )
+
+    # Return the response to Dialogflow.
+    return jsonify({
+        "fulfillmentText": response_text
+    })
+
+# --- Firestore Query Function ---
+def verify_patient_insurance(policy_number, provider, dob):
+    """
+    Queries the Firestore 'patients' collection to find a matching document.
+    """
+    try:
+        patients_ref = db.collection('patients')
+
+        # Build the compound query with all criteria.
+        query = patients_ref \
+            .where('policyNumber', '==', policy_number) \
+            .where('insuranceProvider', '==', provider) \
+            .where('dateOfBirth', '==', dob)
+
+        docs = query.stream()
+
+        if any(docs):
+            return f"Thank you. Your insurance with {provider} and policy number {policy_number} has been verified."
+        else:
+            return "We could not find a patient with the information you provided. Please check your details and try again."
+    except Exception as e:
+        print(f"Database query failed: {e}")
+        return "Sorry, I am having trouble connecting to the database. Please try again later."
+
+# --- Application Entry Point ---
 if __name__ == '__main__':
-    # Add dummy data for local testing if running directly
-    # To test this locally, you would need to set up Firebase authentication
-    # and provide credentials via environment variables.
-    print("This script is designed to run as a webhook. For local testing, ensure Firebase is configured.")
-    app.run(port=5000, debug=True)
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
