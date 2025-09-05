@@ -52,9 +52,10 @@ def verify_insurance():
         patients_collection_ref = db.collection(f'artifacts/{app_id}/public/data/patients')
 
         # Create a query to find a matching patient document
-        query = patients_collection_ref.where('policy_number', '==', policy_number) \
-                                     .where('date_of_birth', '==', dob_str) \
-                                     .where('insurance_provider', '==', insurance_provider)
+        # The field names here must exactly match the ones in your database.
+        query = patients_collection_ref.where('policyNumber', '==', policy_number) \
+                                     .where('dateOfBirth', '==', dob_str) \
+                                     .where('insuranceProvider', '==', insurance_provider)
 
         docs = list(query.stream())
 
