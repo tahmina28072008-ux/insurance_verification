@@ -3,6 +3,7 @@
 # connects to a Firestore database for patient data verification.
 
 import os
+import json
 import firebase_admin
 from firebase_admin import credentials, firestore
 from flask import Flask, request, jsonify
@@ -40,38 +41,66 @@ def webhook():
     Handles POST requests from Dialogflow. It extracts patient information
     from the request and verifies it against the Firestore 'patients' collection.
     """
+    print("--- Webhook Request Received ---")
     req = request.get_json(force=True)
-    print("Request JSON:")
-    print(req)
+    
+    # Log the full request JSON for debugging
+    print("Full Request JSON:")
+    print(json.dumps(req, indent=2))
+    print("-----------------------------------")
 
-    query_result = req.get('queryResult', {})
-    params = query_result.get('parameters', {})
+    # The Dialogflow CX webhook format has a different structure for parameters.
+    # The parameters are nested inside 'sessionInfo'.
+    session_info = req.get('sessionInfo', {})
+    params = session_info.get('parameters', {})
     
     # Extract parameters based on your Dialogflow CX configuration.
     patient_policy_number = params.get('policy_number', '')
     patient_provider = params.get('insurance_provider_name', '')
     patient_dob_obj = params.get('date_of_birth', {})
     
+    # Log the extracted parameters
+    print("Extracted Parameters:")
+    print(f"Policy Number: {patient_policy_number}")
+    print(f"Provider: {patient_provider}")
+    print(f"DOB Object: {patient_dob_obj}")
+    print("-----------------------------------")
+
     # Check if all required parameters are available.
     if not all([patient_policy_number, patient_provider, patient_dob_obj]):
-        return jsonify({
-            "fulfillmentText": "Please provide your policy number, insurance provider, and date of birth to proceed with verification."
-        })
+        response_text = "Please provide your policy number, insurance provider, and date of birth to proceed with verification."
+    else:
+        # Format the date of birth object into a 'YYYY-MM-DD' string to match your Firestore document.
+        # Ensure month and day are two digits.
+        dob_string = f"{patient_dob_obj.get('year')}-{int(patient_dob_obj.get('month', 0)):02d}-{int(patient_dob_obj.get('day', 0)):02d}"
 
-    # Format the date of birth object into a 'YYYY-MM-DD' string to match your Firestore document.
-    dob_string = f"{patient_dob_obj.get('year')}-{patient_dob_obj.get('month'):02d}-{patient_dob_obj.get('day'):02d}"
-
-    # Call the function to query the database.
-    response_text = verify_patient_insurance(
-        patient_policy_number,
-        patient_provider,
-        dob_string
-    )
+        # Call the function to query the database.
+        response_text = verify_patient_insurance(
+            patient_policy_number,
+            patient_provider,
+            dob_string
+        )
+    
+    # Construct the final response in the format Dialogflow CX expects.
+    dialogflow_response = {
+        "fulfillmentResponse": {
+            "messages": [
+                {
+                    "text": {
+                        "text": [response_text]
+                    }
+                }
+            ]
+        }
+    }
+    
+    # Log the response JSON before sending it
+    print("Final Dialogflow Response JSON:")
+    print(json.dumps(dialogflow_response, indent=2))
+    print("-----------------------------------")
 
     # Return the response to Dialogflow.
-    return jsonify({
-        "fulfillmentText": response_text
-    })
+    return jsonify(dialogflow_response)
 
 # --- Firestore Query Function ---
 def verify_patient_insurance(policy_number, provider, dob):
@@ -89,9 +118,12 @@ def verify_patient_insurance(policy_number, provider, dob):
 
         docs = query.stream()
 
+        # Check if any documents were found.
         if any(docs):
+            print("Database match found. Verification successful.")
             return f"Thank you. Your insurance with {provider} and policy number {policy_number} has been verified."
         else:
+            print("No matching document found. Verification failed.")
             return "We could not find a patient with the information you provided. Please check your details and try again."
     except Exception as e:
         print(f"Database query failed: {e}")
